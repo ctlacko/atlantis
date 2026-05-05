@@ -34,6 +34,8 @@ public final class Atlantis: NSObject {
     private var ignoreProtocols: [AnyClass] = []
     private let queue = DispatchQueue(label: "com.proxyman.atlantis")
     private var ignoredRequestIds: Set<String> = []
+    private var completedTaskIds: Set<String> = []
+    private var recentlySentTraffic: [String: TimeInterval] = [:]
 
     // MARK: - Variables
 
@@ -414,8 +416,8 @@ extension Atlantis {
             // Remove after the WS connection is closed
             let id = PackageIdentifier.getID(taskOrConnection: task)
             packages.removeValue(forKey: id)
-            // Clean up taskStartTimes for closed WebSocket connections
             taskStartTimes.removeValue(forKey: id)
+            completedTaskIds.remove(id)
         }
     }
 
@@ -448,9 +450,41 @@ extension Atlantis {
     private func handleDidFinish(_ taskOrConnection: AnyObject, error: Error?) {
         queue.sync {
             guard Atlantis.isEnabled.value else { return }
+
+            // Guard 1: Same-task-object fires twice (multiple
+            // __NSCFURLLocalSessionConnection instances referencing one task).
+            let taskId = PackageIdentifier.getID(taskOrConnection: taskOrConnection)
+            guard !completedTaskIds.contains(taskId) else { return }
+
             guard let package = getPackage(taskOrConnection, isCompleted: true) else {
                 return
             }
+
+            // Guard 2: Different task objects for the same logical request.
+            // The URL loading system's internal protocol layer can create a
+            // second URLSessionTask to service the same request. Both tasks
+            // flow through __NSCFURLLocalSessionConnection and reach here
+            // with different object identities but the same originalRequest.
+            // We deduplicate by (URL, method, bodyLength) within a short
+            // time window.
+            if let task = taskOrConnection as? URLSessionTask,
+               let originalURL = task.originalRequest?.url?.absoluteString {
+                let method = task.originalRequest?.httpMethod ?? ""
+                let bodyLen = task.originalRequest?.httpBody?.count ?? 0
+                let dedupeKey = "\(originalURL)|\(method)|\(bodyLen)"
+                let now = Date().timeIntervalSince1970
+                if let lastSent = recentlySentTraffic[dedupeKey],
+                   now - lastSent < 0.1 {
+                    removeCompletedPackage(taskOrConnection: taskOrConnection, package: package)
+                    return
+                }
+                recentlySentTraffic[dedupeKey] = now
+                if recentlySentTraffic.count > 200 {
+                    recentlySentTraffic = recentlySentTraffic.filter { now - $0.value < 1.0 }
+                }
+            }
+
+            completedTaskIds.insert(taskId)
 
             // All done
             package.updateDidComplete(error)

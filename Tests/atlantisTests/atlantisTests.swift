@@ -277,6 +277,35 @@ final class URLSessionSwizzleTests: XCTestCase {
         XCTAssertFalse(package.responseBodyData.isEmpty)
     }
 
+    func testGetRequestNotDuplicated() {
+        let path = "/get"
+        let url = baseURL.appendingPathComponent("get")
+        let packages = collectAllTrafficPackages(matching: { $0.request.url.contains(path) },
+                                                 settleTime: 1.0) {
+            let session = makeSession()
+            let task = session.dataTask(with: url)
+            task.resume()
+        }
+        XCTAssertEqual(packages.count, 1, "Expected exactly 1 traffic entry for a single GET, got \(packages.count)")
+    }
+
+    func testPostRequestNotDuplicated() {
+        let url = baseURL.appendingPathComponent("post")
+        let body = "dedup-test".data(using: .utf8)!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("text/plain", forHTTPHeaderField: "Content-Type")
+
+        let packages = collectAllTrafficPackages(matching: { $0.request.url.contains("/post") },
+                                                 settleTime: 1.0) {
+            let session = makeSession()
+            let task = session.dataTask(with: request)
+            task.resume()
+        }
+        XCTAssertEqual(packages.count, 1, "Expected exactly 1 traffic entry for a single POST, got \(packages.count)")
+    }
+
     func testPostRequestCaptured() {
         let url = baseURL.appendingPathComponent("post")
         let body = "hello-atlantis".data(using: .utf8)!
@@ -626,6 +655,38 @@ final class URLSessionSwizzleTests: XCTestCase {
         action()
         wait(for: [expectation], timeout: 30)
         return capturedPackage!
+    }
+
+    private func collectAllTrafficPackages(matching predicate: @escaping (TrafficPackage) -> Bool,
+                                               settleTime: TimeInterval,
+                                               action: () -> Void) -> [TrafficPackage] {
+        let firstArrival = expectation(description: "At least one matching traffic package")
+        let lock = NSLock()
+        var collected: [TrafficPackage] = []
+        var didFulfill = false
+
+        transporter.onTrafficPackage = { package in
+            guard predicate(package) else { return }
+            lock.lock()
+            defer { lock.unlock() }
+            collected.append(package)
+            if !didFulfill {
+                didFulfill = true
+                firstArrival.fulfill()
+            }
+        }
+
+        action()
+        wait(for: [firstArrival], timeout: 30)
+
+        let settle = expectation(description: "Settle")
+        settle.isInverted = true
+        wait(for: [settle], timeout: settleTime)
+
+        transporter.onTrafficPackage = nil
+        lock.lock()
+        defer { lock.unlock() }
+        return collected
     }
 
     private func assertPackageHasSuccessResponse(_ package: TrafficPackage,
