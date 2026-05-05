@@ -35,7 +35,7 @@ public final class Atlantis: NSObject {
     private let queue = DispatchQueue(label: "com.proxyman.atlantis")
     private var ignoredRequestIds: Set<String> = []
     private var completedTaskIds: Set<String> = []
-    private var recentlySentTraffic: [String: TimeInterval] = [:]
+    private var pendingDedup: [String: PendingTraffic] = [:]
 
     // MARK: - Variables
 
@@ -447,6 +447,14 @@ extension Atlantis {
 
 extension Atlantis {
 
+    private struct PendingTraffic {
+        let taskOrConnection: AnyObject
+        let package: TrafficPackage
+        let error: Error?
+    }
+
+    private static let deduplicationDelay: TimeInterval = 0.015 // 15ms
+
     private func handleDidFinish(_ taskOrConnection: AnyObject, error: Error?) {
         queue.sync {
             guard Atlantis.isEnabled.value else { return }
@@ -460,62 +468,72 @@ extension Atlantis {
                 return
             }
 
-            // Guard 2: Different task objects for the same logical request.
-            // The URL loading system's internal protocol layer can create a
-            // second URLSessionTask to service the same request. Both tasks
-            // flow through __NSCFURLLocalSessionConnection and reach here
-            // with different object identities but the same originalRequest.
-            // We deduplicate by (URL, method, bodyLength) within a short
-            // time window.
-            if let task = taskOrConnection as? URLSessionTask,
-               let originalURL = task.originalRequest?.url?.absoluteString {
-                let method = task.originalRequest?.httpMethod ?? ""
-                let bodyLen = task.originalRequest?.httpBody?.count ?? 0
-                let dedupeKey = "\(originalURL)|\(method)|\(bodyLen)"
-                let now = Date().timeIntervalSince1970
-                if let lastSent = recentlySentTraffic[dedupeKey],
-                   now - lastSent < 0.1 {
-                    removeCompletedPackage(taskOrConnection: taskOrConnection, package: package)
-                    return
-                }
-                recentlySentTraffic[dedupeKey] = now
-                if recentlySentTraffic.count > 200 {
-                    recentlySentTraffic = recentlySentTraffic.filter { now - $0.value < 1.0 }
-                }
-            }
-
             completedTaskIds.insert(taskId)
-
-            // All done
             package.updateDidComplete(error)
 
+            // SSE and WebSocket traffic is never duplicated by the protocol
+            // layer, so send immediately without dedup buffering.
             if package.isServerSentEventStream {
                 sendServerSentEventCloseMessage(package: package, error: error)
                 removeCompletedPackage(taskOrConnection: taskOrConnection, package: package)
                 return
             }
-
-            // At this time, the package has all the data
-            // It's time to send it
-            startSendingMessage(package: package)
-
-            // Then remove it from our cache
-            switch package.packageType {
-            case .http:
-                removeCompletedPackage(taskOrConnection: taskOrConnection, package: package)
-            case .websocket:
-                // Don't remove the WS traffic
-                // Keep it in the packages, so we can send the WS Message
-                // Only remove the we receive the Close message
-
-                // Sending all waiting WS
+            if package.packageType == .websocket {
+                startSendingMessage(package: package)
                 attemptSendingAllWaitingWSPackages(id: package.id)
-                // Clean up taskStartTimes for completed WebSocket requests
-                let taskId = PackageIdentifier.getID(taskOrConnection: taskOrConnection)
                 taskStartTimes.removeValue(forKey: taskId)
-                break
+                return
+            }
+
+            // Guard 2: Different task objects for the same logical request.
+            // The URL loading system's internal protocol layer can create a
+            // second URLSessionTask to service the same request.  The
+            // protocol-layer task typically completes first but carries the
+            // pre-processed request (missing system-injected headers like
+            // Accept-Language).  The user's task completes 1-7 ms later
+            // with the full wire headers.
+            //
+            // Strategy: buffer the send for a short window.  If a second
+            // completion arrives for the same (URL, method, bodyLength) key
+            // we replace the pending package so the last — most complete —
+            // version is the one actually sent.
+            let dedupeKey = deduplicationKey(for: taskOrConnection)
+            if let dedupeKey = dedupeKey, pendingDedup[dedupeKey] != nil {
+                // A duplicate already waiting — replace it with this
+                // (later, more complete) version and discard the old package.
+                let old = pendingDedup[dedupeKey]!
+                removeCompletedPackage(taskOrConnection: old.taskOrConnection, package: old.package)
+                pendingDedup[dedupeKey] = PendingTraffic(taskOrConnection: taskOrConnection, package: package, error: error)
+                return
+            }
+
+            if let dedupeKey = dedupeKey {
+                pendingDedup[dedupeKey] = PendingTraffic(taskOrConnection: taskOrConnection, package: package, error: error)
+                queue.asyncAfter(deadline: .now() + Atlantis.deduplicationDelay) { [weak self] in
+                    self?.flushPendingTraffic(dedupeKey: dedupeKey)
+                }
+            } else {
+                // No dedup key (e.g. originalRequest is nil) — send immediately.
+                startSendingMessage(package: package)
+                removeCompletedPackage(taskOrConnection: taskOrConnection, package: package)
             }
         }
+    }
+
+    private func deduplicationKey(for taskOrConnection: AnyObject) -> String? {
+        guard let task = taskOrConnection as? URLSessionTask,
+              let url = task.originalRequest?.url?.absoluteString else {
+            return nil
+        }
+        let method = task.originalRequest?.httpMethod ?? ""
+        let bodyLen = task.originalRequest?.httpBody?.count ?? 0
+        return "\(url)|\(method)|\(bodyLen)"
+    }
+
+    private func flushPendingTraffic(dedupeKey: String) {
+        guard let pending = pendingDedup.removeValue(forKey: dedupeKey) else { return }
+        startSendingMessage(package: pending.package)
+        removeCompletedPackage(taskOrConnection: pending.taskOrConnection, package: pending.package)
     }
 
     func startSendingMessage(package: TrafficPackage) {
